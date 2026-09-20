@@ -40,6 +40,7 @@ def root():
         "service": "self-healing-llm-gateway",
         "phase": 2,
         "providers": [p.name for p in router.pool],
+        "request_classes": router.preference_lists,
         "endpoints": ["/v1/chat/completions", "/v1/models", "/health", "/docs"],
     }
 
@@ -96,7 +97,7 @@ async def chat_completions(
     response.headers["X-Request-Id"] = meta.request_id
 
     try:
-        result = await router.complete(request)
+        result = await router.complete(request, request_class=meta.request_class)
     except ProviderError as exc:
         # Reached only when EVERY provider in the pool has failed.
         return JSONResponse(
