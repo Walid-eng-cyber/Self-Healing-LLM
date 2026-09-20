@@ -3,6 +3,18 @@
 This document explains how the gateway works and how the design leaves room for
 the later phases. If you only read one file to understand the code, read this one.
 
+## System overview
+
+![Self-healing LLM gateway request flow](architecture.svg)
+
+A request flows top to bottom: the client (an OpenAI SDK pointed at the gateway)
+sends a call with tenant/feature headers; the **metadata gate** rejects it with
+400 if those are missing; the **router** tries the **provider pool** in order,
+failing over between providers that LiteLLM normalizes; a **cost record** is
+logged; and an OpenAI-shaped **response** returns with the request-id echoed.
+Each provider in the pool is guarded by its own **circuit breaker** (closed →
+open → half-open), shown in the legend. The sections below describe each part.
+
 ## Phase 2 update — LiteLLM provider pool + failover
 
 The single provider from Phase 1 is now a **pool of three**, fronted by a
