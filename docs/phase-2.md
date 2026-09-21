@@ -186,6 +186,33 @@ because you stop knocking on its door until it is likely to answer.
 
 ---
 
+## 5b. Failover follows the request "class"
+
+When a breaker opens, which provider gets the traffic next? That depends on the
+**request class** — because not all requests should fail over the same way.
+
+A cheap, high-volume **classification** call and an expensive **long-form
+generation** call have different priorities. So each class has its own ordered
+preference list of providers (`REQUEST_CLASSES` in
+[`app/config.py`](../app/config.py)):
+
+| Class | Preference order | Why |
+|-------|------------------|-----|
+| `classification` | ollama → gemini → openai | cheap and fast first; the expensive model is the last resort |
+| `generation` | openai → anthropic → ollama | quality first; the small local model only if the cloud is down |
+| `default` | the full pool in order | used when no class is given |
+
+The client picks the class with an optional `X-Request-Class` header. The router
+then walks *that* list, skipping any provider whose breaker is open.
+
+Concretely: if `ollama`'s breaker trips **open** —
+
+- a `classification` request reroutes to **gemini** (next in its list),
+- a `generation` request is unaffected — it started at `openai` anyway.
+
+Same outage, two different reroutes. That is the whole point: failover order is a
+property of the request class, not one fixed order for everyone.
+
 ## 6. Per-provider — and why that matters
 
 Each provider gets its **own** breaker. OpenAI's breaker knows nothing about

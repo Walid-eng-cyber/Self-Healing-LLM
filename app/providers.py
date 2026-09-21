@@ -21,7 +21,13 @@ import time
 import litellm
 
 from .circuit_breaker import CircuitBreaker
-from .config import PROVIDER_SPECS, ProviderSpec, settings
+from .config import (
+    DEFAULT_REQUEST_CLASS,
+    PROVIDER_SPECS,
+    REQUEST_CLASSES,
+    ProviderSpec,
+    settings,
+)
 from .schemas import ChatCompletionRequest, ChatCompletionResponse
 
 # Keep LiteLLM quiet; we do our own error handling and logging.
@@ -158,27 +164,61 @@ class LiteLLMProvider(Provider):
 
 class RouterProvider(Provider):
     """
-    Fails over across the pool: try each provider in order, return the first
-    success. If every provider fails, raise a combined ProviderError.
+    Fails over across the pool using a per-request-class preference list.
+
+    Each request class (e.g. "classification", "generation") has its own ordered
+    list of provider names. The router tries them in that order and returns the
+    first success. A provider whose circuit breaker is open raises ProviderError
+    from `allow()`, so the router simply moves on to the next provider *in that
+    class's list* — which is how a cheap classification call and a long-form
+    generation call fail over differently.
     """
 
     name = "router"
 
-    def __init__(self, pool: list[LiteLLMProvider]) -> None:
+    def __init__(
+        self,
+        pool: list[LiteLLMProvider],
+        preference_lists: dict[str, list[str]],
+        default_class: str,
+    ) -> None:
         if not pool:
             raise ValueError("RouterProvider needs at least one provider")
-        self.pool = pool
+        self.pool = pool  # declared order, kept for /health
+        self.by_name = {p.name: p for p in pool}
+        self.preference_lists = preference_lists
+        self.default_class = default_class
 
-    async def complete(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
+    def providers_for(self, request_class: str) -> list[LiteLLMProvider]:
+        """Resolve a request class to its ordered list of provider objects."""
+        names = self.preference_lists.get(request_class)
+        if not names:
+            # Unknown class -> fall back to the default class, then the pool.
+            names = self.preference_lists.get(self.default_class) or [
+                p.name for p in self.pool
+            ]
+        return [self.by_name[n] for n in names if n in self.by_name]
+
+    async def complete(
+        self,
+        request: ChatCompletionRequest,
+        request_class: str | None = None,
+    ) -> ChatCompletionResponse:
+        request_class = request_class or self.default_class
+        providers = self.providers_for(request_class)
+
         errors: list[str] = []
-        for provider in self.pool:
+        for provider in providers:
             try:
                 return await provider.complete(request)
             except ProviderError as exc:
-                # This upstream failed; record why and fall through to the next.
+                # Open breaker or a real failure; fall through to the next
+                # provider in THIS class's preference list.
                 errors.append(str(exc))
                 continue
-        raise ProviderError("all providers failed -> " + " | ".join(errors))
+        raise ProviderError(
+            f"all providers failed for class '{request_class}' -> " + " | ".join(errors)
+        )
 
 
 def build_pool() -> list[LiteLLMProvider]:
@@ -187,4 +227,4 @@ def build_pool() -> list[LiteLLMProvider]:
 
 
 def build_router() -> RouterProvider:
-    return RouterProvider(build_pool())
+    return RouterProvider(build_pool(), REQUEST_CLASSES, DEFAULT_REQUEST_CLASS)

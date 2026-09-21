@@ -47,6 +47,27 @@ PROVIDER_SPECS: list[ProviderSpec] = [
 ]
 
 
+# --- Request classes -> provider preference lists ---
+#
+# Different kinds of request should fail over differently. A cheap, high-volume
+# classification call prefers fast/cheap providers; a long-form generation call
+# prefers stronger models and only falls back to the local one as a last resort.
+# Each list is an ordered set of provider NAMES (from PROVIDER_SPECS). The router
+# tries them in this order, skipping any whose circuit breaker is open.
+DEFAULT_REQUEST_CLASS = "default"
+
+_ALL_PROVIDERS = [spec.name for spec in PROVIDER_SPECS]
+
+REQUEST_CLASSES: dict[str, list[str]] = {
+    # cheap + fast first; big cloud model only if the others are down
+    "classification": ["ollama", "gemini", "openai"],
+    # quality first; local model is the last resort
+    "generation": ["openai", "anthropic", "ollama"],
+    # unspecified/unknown class -> the full pool in declared order
+    DEFAULT_REQUEST_CLASS: _ALL_PROVIDERS,
+}
+
+
 # Approximate list prices in USD per 1,000,000 tokens, keyed by the short model
 # name (the "provider/" prefix is stripped before lookup). Used to turn token
 # counts into an attributable cost per request. Local models are free.

@@ -48,6 +48,7 @@ def record_usage(
         "request_id": meta.request_id,
         "tenant": meta.tenant,
         "feature": meta.feature,
+        "request_class": meta.request_class,
         "model": model,
         "served_by": served_by,
         "prompt_tokens": usage.prompt_tokens,

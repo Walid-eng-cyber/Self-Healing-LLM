@@ -137,3 +137,24 @@ req 2: served_by=primary  primary.circuit=closed    <- recovered
 Each provider gets its **own** breaker. One vendor's outage trips only that
 vendor's circuit; the others keep serving. That isolation is the point — a bad
 provider is quarantined, not allowed to affect the healthy ones.
+
+## Failover order is per request class
+
+When a breaker opens, the router does not just walk one global list — it walks
+the preference list for the request's **class**. The class comes from the
+optional `X-Request-Class` header (default: `default`).
+
+Different kinds of request should fail over differently. Defined in
+`REQUEST_CLASSES` in `app/config.py`:
+
+| Class | Preference order | Rationale |
+|-------|------------------|-----------|
+| `classification` | ollama → gemini → openai | cheap/fast first; big model last |
+| `generation` | openai → anthropic → ollama | quality first; local as last resort |
+| `default` | ollama → openai → anthropic → gemini | the full pool in declared order |
+
+So if `ollama`'s breaker is open, a **classification** request fails over to
+`gemini`, while a **generation** request was never sending to `ollama` first
+anyway and still starts at `openai`. Same outage, different reroute. An unknown
+class falls back to the `default` list. The chosen class is also written to each
+usage record, so cost can be attributed per class.
