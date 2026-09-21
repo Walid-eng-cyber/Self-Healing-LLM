@@ -9,11 +9,13 @@ dashboard.
 - **Phase 1 (done): Route every model call through one service.** A FastAPI
   service that speaks the OpenAI `/v1/chat/completions` request/response shape,
   so existing OpenAI clients adopt it by changing only their `base_url`.
-- **Phase 2 (done): Per-provider circuit breaker.** LiteLLM normalizes vendor
+- **Phase 2 (done): Self-healing resilience.** LiteLLM normalizes vendor
   differences; a pool of providers (a local Ollama model plus OpenAI, Anthropic,
-  Gemini) fails over automatically. Each provider has a circuit breaker with
-  closed / open / half-open states that trips on error rate or p95 latency and
-  recovers on its own. See [docs/circuit-breaker.md](docs/circuit-breaker.md).
+  Gemini) fails over automatically. Each provider has a circuit breaker
+  (closed / open / half-open) that trips on error rate or p95 latency and
+  recovers on its own via half-open probes; failover follows per-request-class
+  preference lists; and latency-sensitive classes can hedge. Full write-up in
+  [docs/phase-2.md](docs/phase-2.md).
 - Phase 3: Redis caching + rate limiting.
 - Phase 4: Prometheus metrics + Grafana dashboard.
 
@@ -24,10 +26,9 @@ dashboard.
   happens to a request. Read this to understand the project.
 - [docs/architecture.md](docs/architecture.md) — the terse reference: request
   lifecycle, each module, and the full API reference.
-- **[docs/phase-2.md](docs/phase-2.md)** — the per-provider circuit breaker
-  explained from the ground up, in plain language. Start here to understand it.
-- [docs/circuit-breaker.md](docs/circuit-breaker.md) — the terse reference for
-  the same: states, trip conditions, configuration, and how to verify it.
+- **[docs/phase-2.md](docs/phase-2.md)** — the complete Phase 2 write-up in one
+  place: the circuit breaker, half-open probes, per-request-class failover, and
+  hedged requests (with the cost trade-off), plus config and tests.
 
 ## Run it
 

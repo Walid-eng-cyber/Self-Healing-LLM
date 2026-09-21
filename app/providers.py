@@ -16,12 +16,14 @@ every vendor — we only change the model string.
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 import litellm
 
 from .circuit_breaker import CircuitBreaker
 from .config import (
+    CLASS_HEDGE_MS,
     DEFAULT_REQUEST_CLASS,
     PROVIDER_SPECS,
     REQUEST_CLASSES,
@@ -181,6 +183,7 @@ class RouterProvider(Provider):
         pool: list[LiteLLMProvider],
         preference_lists: dict[str, list[str]],
         default_class: str,
+        hedge_ms: dict[str, int] | None = None,
     ) -> None:
         if not pool:
             raise ValueError("RouterProvider needs at least one provider")
@@ -188,6 +191,8 @@ class RouterProvider(Provider):
         self.by_name = {p.name: p for p in pool}
         self.preference_lists = preference_lists
         self.default_class = default_class
+        # class -> hedge delay in ms; classes absent here are never hedged
+        self.hedge_ms = hedge_ms or {}
 
     def providers_for(self, request_class: str) -> list[LiteLLMProvider]:
         """Resolve a request class to its ordered list of provider objects."""
@@ -206,19 +211,97 @@ class RouterProvider(Provider):
     ) -> ChatCompletionResponse:
         request_class = request_class or self.default_class
         providers = self.providers_for(request_class)
+        hedge_ms = self.hedge_ms.get(request_class)
 
-        errors: list[str] = []
+        if hedge_ms and len(providers) >= 2:
+            return await self._hedged(providers, request, request_class, hedge_ms)
+
+        result = await self._sequential(providers, request, request_class)
+        result.hedged = False
+        return result
+
+    async def _one(
+        self, provider: LiteLLMProvider, request: ChatCompletionRequest
+    ) -> tuple[ChatCompletionResponse | None, str | None]:
+        """Call one provider, returning (response, None) or (None, error)."""
+        try:
+            return await provider.complete(request), None
+        except ProviderError as exc:
+            return None, str(exc)
+
+    async def _sequential(
+        self,
+        providers: list[LiteLLMProvider],
+        request: ChatCompletionRequest,
+        request_class: str,
+        errors: list[str] | None = None,
+    ) -> ChatCompletionResponse:
+        """Plain failover: try providers in order, return the first success."""
+        errs = list(errors or [])
         for provider in providers:
-            try:
-                return await provider.complete(request)
-            except ProviderError as exc:
-                # Open breaker or a real failure; fall through to the next
-                # provider in THIS class's preference list.
-                errors.append(str(exc))
-                continue
+            res, err = await self._one(provider, request)
+            if res is not None:
+                return res
+            errs.append(err)
         raise ProviderError(
-            f"all providers failed for class '{request_class}' -> " + " | ".join(errors)
+            f"all providers failed for class '{request_class}' -> " + " | ".join(errs)
         )
+
+    async def _hedged(
+        self,
+        providers: list[LiteLLMProvider],
+        request: ChatCompletionRequest,
+        request_class: str,
+        hedge_ms: int,
+    ) -> ChatCompletionResponse:
+        """
+        Start the primary; if it hasn't answered within hedge_ms, fire the second
+        provider too and race them, cancelling the loser. Falls back to the rest
+        of the list if the raced providers both fail.
+        """
+        delay = hedge_ms / 1000.0
+        errors: list[str] = []
+
+        primary_task = asyncio.create_task(self._one(providers[0], request))
+        done, _pending = await asyncio.wait({primary_task}, timeout=delay)
+
+        # Primary answered (or failed) within the hedge window -> no hedge fired.
+        if done:
+            res, err = primary_task.result()
+            if res is not None:
+                res.hedged = False
+                return res
+            errors.append(err)
+            result = await self._sequential(
+                providers[1:], request, request_class, errors
+            )
+            result.hedged = False
+            return result
+
+        # Primary is slow -> fire the hedge (the second provider) and race.
+        second_task = asyncio.create_task(self._one(providers[1], request))
+        racers = {primary_task, second_task}
+        while racers:
+            finished, _p = await asyncio.wait(
+                racers, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in finished:
+                racers.discard(task)
+                res, err = task.result()
+                if res is not None:
+                    # Winner: cancel the loser(s) and wait for them to unwind.
+                    for loser in racers:
+                        loser.cancel()
+                    if racers:
+                        await asyncio.gather(*racers, return_exceptions=True)
+                    res.hedged = True
+                    return res
+                errors.append(err)
+
+        # Both raced providers failed -> fall back to the rest of the list.
+        result = await self._sequential(providers[2:], request, request_class, errors)
+        result.hedged = True
+        return result
 
 
 def build_pool() -> list[LiteLLMProvider]:
@@ -227,4 +310,6 @@ def build_pool() -> list[LiteLLMProvider]:
 
 
 def build_router() -> RouterProvider:
-    return RouterProvider(build_pool(), REQUEST_CLASSES, DEFAULT_REQUEST_CLASS)
+    return RouterProvider(
+        build_pool(), REQUEST_CLASSES, DEFAULT_REQUEST_CLASS, hedge_ms=CLASS_HEDGE_MS
+    )

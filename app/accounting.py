@@ -42,8 +42,12 @@ def record_usage(
     model: str,
     served_by: str,
     usage: Usage,
+    hedged: bool = False,
 ) -> dict:
     """Build, log, and return the usage record for one request."""
+    winner_cost = estimate_cost_usd(
+        model, usage.prompt_tokens, usage.completion_tokens
+    )
     record = {
         "request_id": meta.request_id,
         "tenant": meta.tenant,
@@ -51,11 +55,15 @@ def record_usage(
         "request_class": meta.request_class,
         "model": model,
         "served_by": served_by,
+        "hedged": hedged,
         "prompt_tokens": usage.prompt_tokens,
         "completion_tokens": usage.completion_tokens,
         "total_tokens": usage.total_tokens,
-        "estimated_cost_usd": estimate_cost_usd(
-            model, usage.prompt_tokens, usage.completion_tokens
+        "estimated_cost_usd": winner_cost,
+        # A hedged call also runs a loser we cancel, so real spend is higher.
+        # We can't know the loser's exact tokens, so we flag ~2x as a guide.
+        "estimated_cost_with_hedge_usd": (
+            round(winner_cost * 2, 6) if hedged and winner_cost is not None else winner_cost
         ),
     }
     logger.info("usage %s", json.dumps(record))

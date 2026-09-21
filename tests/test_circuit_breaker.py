@@ -21,16 +21,20 @@ class FakeClock:
         self.t += dt
 
 
-def make_breaker(clock: FakeClock, **overrides) -> CircuitBreaker:
+def make_breaker(clock: FakeClock, rand=lambda: 0.0, **overrides) -> CircuitBreaker:
+    # Default rand=0.0 always samples below the probe ratio -> a probe is always
+    # admitted, which keeps the recovery tests deterministic. Probe-sampling
+    # tests pass their own rand.
     kwargs = dict(
         window_seconds=30.0,
         min_requests=5,
         error_rate_threshold=0.5,
         p95_budget_ms=2000.0,
         open_cooldown_seconds=15.0,
-        half_open_max_calls=3,
-        half_open_successes_to_close=2,
+        half_open_probe_ratio=0.1,
+        half_open_successes_to_close=1,
         clock=clock,
+        rand=rand,
     )
     kwargs.update(overrides)
     return CircuitBreaker("test", **kwargs)
@@ -102,39 +106,43 @@ def test_open_moves_to_half_open_after_cooldown():
 
 # --- HALF_OPEN behavior -----------------------------------------------------
 
-def test_half_open_closes_after_enough_successes():
+def test_half_open_probe_success_closes():
     clock = FakeClock()
-    breaker = make_breaker(clock)
+    breaker = make_breaker(clock)  # rand=0 -> probe admitted; 1 success closes
     feed(breaker, [(False, 10)] * 5)
     clock.advance(16)
-    # Two trial successes (successes_to_close=2) -> CLOSED.
-    assert breaker.allow() is True
-    breaker.record(ok=True, latency_ms=10)
-    assert breaker.allow() is True
-    breaker.record(ok=True, latency_ms=10)
+    assert breaker.allow() is True          # probe admitted
+    breaker.record(ok=True, latency_ms=10)  # probe succeeds
     assert breaker.state is CircuitState.CLOSED
 
 
-def test_half_open_reopens_on_a_failure():
+def test_half_open_probe_failure_reopens():
     clock = FakeClock()
     breaker = make_breaker(clock)
     feed(breaker, [(False, 10)] * 5)
     clock.advance(16)
-    assert breaker.allow() is True
-    breaker.record(ok=False, latency_ms=10)  # trial fails -> back to OPEN
+    assert breaker.allow() is True           # probe admitted
+    breaker.record(ok=False, latency_ms=10)  # probe fails -> immediately OPEN
     assert breaker.state is CircuitState.OPEN
 
 
-def test_half_open_limits_trial_calls():
+def test_half_open_admits_only_sampled_fraction():
     clock = FakeClock()
-    breaker = make_breaker(clock)
+    # rand returns 0.5, above the 0.1 probe ratio -> this request is NOT a probe.
+    breaker = make_breaker(clock, rand=lambda: 0.5)
     feed(breaker, [(False, 10)] * 5)
     clock.advance(16)
-    # half_open_max_calls = 3: first three allowed, fourth blocked.
+    assert breaker.allow() is False               # routed away, not a probe
+    assert breaker.state is CircuitState.HALF_OPEN  # still testing the waters
+
+
+def test_half_open_admits_probe_when_sampled():
+    clock = FakeClock()
+    # rand returns 0.05, below the 0.1 probe ratio -> admitted as a probe.
+    breaker = make_breaker(clock, rand=lambda: 0.05)
+    feed(breaker, [(False, 10)] * 5)
+    clock.advance(16)
     assert breaker.allow() is True
-    assert breaker.allow() is True
-    assert breaker.allow() is True
-    assert breaker.allow() is False
 
 
 # --- window pruning ---------------------------------------------------------

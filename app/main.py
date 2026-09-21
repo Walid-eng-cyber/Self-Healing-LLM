@@ -41,6 +41,7 @@ def root():
         "phase": 2,
         "providers": [p.name for p in router.pool],
         "request_classes": router.preference_lists,
+        "hedged_classes_ms": router.hedge_ms,
         "endpoints": ["/v1/chat/completions", "/v1/models", "/health", "/docs"],
     }
 
@@ -113,7 +114,13 @@ async def chat_completions(
         )
 
     # The payoff: attribute this call's cost to the tenant + feature.
-    record_usage(meta, result.model, result.served_by or "unknown", result.usage)
+    record_usage(
+        meta,
+        result.model,
+        result.served_by or "unknown",
+        result.usage,
+        hedged=bool(result.hedged),
+    )
     return result
 
 
