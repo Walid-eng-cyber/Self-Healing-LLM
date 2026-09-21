@@ -68,6 +68,23 @@ REQUEST_CLASSES: dict[str, list[str]] = {
 }
 
 
+# --- Hedged requests (latency-sensitive classes only) ---
+#
+# For a latency-sensitive class, if the primary provider hasn't answered within
+# N milliseconds, fire the next provider too and take whichever returns first,
+# cancelling the loser. This trims tail latency.
+#
+# COST TRADE-OFF: a hedged call can run on two providers at once, so it roughly
+# DOUBLES spend on the calls that actually hedge (both may bill for work done
+# before the loser is cancelled). Enable it only where low latency is worth the
+# money. Classes not listed here are never hedged.
+CLASS_HEDGE_MS: dict[str, int] = {
+    "classification": 200,  # small/fast calls where tail latency matters
+    # "generation" is intentionally omitted: long, expensive calls where paying
+    # twice is not worth it.
+}
+
+
 # Approximate list prices in USD per 1,000,000 tokens, keyed by the short model
 # name (the "provider/" prefix is stripped before lookup). Used to turn token
 # counts into an attributable cost per request. Local models are free.
@@ -93,8 +110,9 @@ class Settings:
     CB_ERROR_RATE_THRESHOLD: float = float(os.getenv("CB_ERROR_RATE_THRESHOLD", "0.5"))
     CB_P95_LATENCY_BUDGET_MS: float = float(os.getenv("CB_P95_LATENCY_BUDGET_MS", "2000"))
     CB_OPEN_COOLDOWN_SECONDS: float = float(os.getenv("CB_OPEN_COOLDOWN_SECONDS", "15"))
-    CB_HALF_OPEN_MAX_CALLS: int = int(os.getenv("CB_HALF_OPEN_MAX_CALLS", "3"))
-    CB_HALF_OPEN_SUCCESSES_TO_CLOSE: int = int(os.getenv("CB_HALF_OPEN_SUCCESSES_TO_CLOSE", "2"))
+    # Fraction of traffic (0..1) sent to a recovering provider as probes.
+    CB_HALF_OPEN_PROBE_RATIO: float = float(os.getenv("CB_HALF_OPEN_PROBE_RATIO", "0.1"))
+    CB_HALF_OPEN_SUCCESSES_TO_CLOSE: int = int(os.getenv("CB_HALF_OPEN_SUCCESSES_TO_CLOSE", "1"))
 
     def breaker_kwargs(self) -> dict:
         return {
@@ -103,7 +121,7 @@ class Settings:
             "error_rate_threshold": self.CB_ERROR_RATE_THRESHOLD,
             "p95_budget_ms": self.CB_P95_LATENCY_BUDGET_MS,
             "open_cooldown_seconds": self.CB_OPEN_COOLDOWN_SECONDS,
-            "half_open_max_calls": self.CB_HALF_OPEN_MAX_CALLS,
+            "half_open_probe_ratio": self.CB_HALF_OPEN_PROBE_RATIO,
             "half_open_successes_to_close": self.CB_HALF_OPEN_SUCCESSES_TO_CLOSE,
         }
 

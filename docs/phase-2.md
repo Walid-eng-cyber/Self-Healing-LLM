@@ -52,9 +52,9 @@ The breaker for each provider is always in one of three states:
     ▲                                           │
     │                                  (wait out the cooldown)
     │                                           ▼
-    └────(a few trial calls succeed)──── HALF_OPEN
+    └────(a probe succeeds)──────────── HALF_OPEN
                                             │
-                                    (a trial call fails)
+                                    (a probe fails)
                                             ▼
                                           OPEN
 ```
@@ -139,18 +139,18 @@ provider that is still shaky.
    skips this provider instantly. No calls are sent; the router uses other
    providers.
 
-2. **HALF_OPEN — a careful test.**
-   Once the cooldown passes, the next request flips the breaker to HALF_OPEN and
-   is allowed through as a **trial**. Only a few trials (`half_open_max_calls`,
-   default **3**) are permitted at once; any extra requests still skip the
-   provider. This protects a fragile provider from being flooded the instant it
-   comes back.
+2. **HALF_OPEN — a careful test with probes.**
+   Once the cooldown passes, the breaker sends only a **small percentage** of
+   traffic back to the recovering provider as **probes**
+   (`half_open_probe_ratio`, default **10%**); the other ~90% still skip it and
+   go to other providers. Trickling a little traffic — rather than flipping the
+   provider fully back on — protects a fragile provider from being flooded the
+   instant it comes back.
 
 3. **Recover or relapse.**
-   - If `half_open_successes_to_close` trials succeed (default **2**), the
-     provider is healthy again → **CLOSED**, and the window is wiped clean for a
-     fresh start.
-   - If **any** trial fails → straight back to **OPEN**, and the cooldown
+   - A probe **succeeds** → the provider looks healthy → **CLOSED** (default: a
+     single success is enough), and the window is wiped clean for a fresh start.
+   - A probe **fails** → straight back to **OPEN** immediately, and the cooldown
      restarts. (A provider that is "sort of" back does not get to limp along.)
 
 ---
@@ -167,7 +167,7 @@ Every call to a provider goes through these four steps
 2. breaker.allow()?  Ask the breaker if a request may go through right now.
                      - CLOSED    -> yes
                      - OPEN      -> no (unless the cooldown just elapsed)
-                     - HALF_OPEN -> yes, but only for the first few trials
+                     - HALF_OPEN -> yes for a small % of traffic (probes)
                      If "no" -> skip this provider (fail fast).
 
 3. call + time it    Send the request to the provider via LiteLLM, and measure
@@ -238,8 +238,8 @@ All configurable via environment variables (defaults in
 | `CB_ERROR_RATE_THRESHOLD` | 0.5 | Trip above this failure rate (0.5 = 50%) |
 | `CB_P95_LATENCY_BUDGET_MS` | 2000 | Trip if p95 latency exceeds this |
 | `CB_OPEN_COOLDOWN_SECONDS` | 15 | How long to stay tripped before testing |
-| `CB_HALF_OPEN_MAX_CALLS` | 3 | Trial requests allowed while testing |
-| `CB_HALF_OPEN_SUCCESSES_TO_CLOSE` | 2 | Trial wins needed to fully recover |
+| `CB_HALF_OPEN_PROBE_RATIO` | 0.1 | Fraction of traffic sent as probes while testing |
+| `CB_HALF_OPEN_SUCCESSES_TO_CLOSE` | 1 | Probe wins needed to fully recover |
 
 > **A real tuning gotcha.** The 2000ms latency budget suits fast cloud APIs. The
 > local Ollama model on this machine measured ~3.6s for one call — legitimately
@@ -281,8 +281,8 @@ python -m pytest tests/test_circuit_breaker.py -v
 11 tests, one per behavior: starts closed, does not trip below the minimum
 sample count, trips on error rate, does not trip at/under the threshold, trips on
 p95 latency, fails fast while open, moves to half-open after the cooldown, closes
-after enough trial successes, reopens on a trial failure, limits the number of
-trials, and prunes old results out of the window.
+on a probe success, reopens on a probe failure, admits only the sampled
+fraction of traffic as probes, and prunes old results out of the window.
 
 ### End-to-end through the router
 

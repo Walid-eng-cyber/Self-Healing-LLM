@@ -88,9 +88,11 @@ class ChatCompletionResponse(BaseModel):
     choices: list[Choice]
     usage: Usage = Field(default_factory=Usage)
 
-    # Gateway-specific metadata: which upstream actually served the request.
-    # Non-standard, so OpenAI clients simply ignore it.
+    # Gateway-specific metadata: which upstream actually served the request, and
+    # whether a hedge (a second provider) was fired for it. Non-standard, so
+    # OpenAI clients simply ignore these.
     served_by: Optional[str] = None
+    hedged: Optional[bool] = None
 
 
 # ---------------------------------------------------------------------------

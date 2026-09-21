@@ -15,9 +15,9 @@ Code: [`app/circuit_breaker.py`](../app/circuit_breaker.py). Each
     ▲                                                              │
     │                                                     (cooldown elapses)
     │                                                              ▼
-    └──(enough trial successes)── HALF_OPEN ◄─────────────── (let a few trials in)
+    └──(a probe succeeds)──────── HALF_OPEN ◄─────────── (send a small % as probes)
                                       │
-                                (any trial fails)
+                                (a probe fails)
                                       ▼
                                     OPEN
 ```
@@ -44,14 +44,18 @@ The reason it tripped is stored in `last_trip_reason` and shown in `/health`.
 
 ## When it recovers (OPEN → HALF_OPEN → CLOSED)
 
+Half-open probes are what make the gateway self-healing: it sends a small
+fraction of traffic back to a recovering provider and lets the result decide.
+
 - While **OPEN**, every request fails fast until `open_cooldown_seconds` has
   passed.
-- The next request moves the breaker to **HALF_OPEN** and is allowed through as a
-  trial. Up to `half_open_max_calls` trials may run concurrently; extra requests
-  still fail fast.
-- If `half_open_successes_to_close` trials succeed, the breaker **closes** and
-  clears its window (fresh start).
-- If any trial **fails**, it goes straight back to **OPEN** and the cooldown
+- After the cooldown the breaker moves to **HALF_OPEN**. Now only a small
+  **percentage** of requests (`half_open_probe_ratio`, default 10%) are admitted
+  as **probes**; the other ~90% still fail fast to other providers, so a shaky
+  provider is never flooded.
+- A probe **succeeds** → the breaker **closes** (default: a single success is
+  enough) and clears its window for a fresh start.
+- A probe **fails** → the breaker reopens **immediately** and the cooldown
   restarts.
 
 ## How a request flows through a provider
@@ -80,9 +84,9 @@ All via environment variables (defaults in `app/config.py`):
 | `CB_MIN_REQUESTS` | 5 | Minimum samples before the breaker may trip |
 | `CB_ERROR_RATE_THRESHOLD` | 0.5 | Trip if error rate exceeds this (0–1) |
 | `CB_P95_LATENCY_BUDGET_MS` | 2000 | Trip if p95 latency exceeds this |
-| `CB_OPEN_COOLDOWN_SECONDS` | 15 | How long OPEN lasts before a trial |
-| `CB_HALF_OPEN_MAX_CALLS` | 3 | Trial requests allowed while HALF_OPEN |
-| `CB_HALF_OPEN_SUCCESSES_TO_CLOSE` | 2 | Trial successes needed to close |
+| `CB_OPEN_COOLDOWN_SECONDS` | 15 | How long OPEN lasts before probing |
+| `CB_HALF_OPEN_PROBE_RATIO` | 0.1 | Fraction of traffic sent as probes while HALF_OPEN |
+| `CB_HALF_OPEN_SUCCESSES_TO_CLOSE` | 1 | Probe successes needed to close |
 
 > **Tuning note.** The 2000ms p95 budget suits cloud APIs. A local model
 > (Ollama) can legitimately be slower than that on modest hardware — a real call
@@ -112,8 +116,9 @@ All via environment variables (defaults in `app/config.py`):
 Unit tests in [`tests/test_circuit_breaker.py`](../tests/test_circuit_breaker.py)
 drive every transition with a fake clock (no sleeps): trips on error rate, trips
 on p95 latency, does not trip below `min_requests` or at/under threshold, fails
-fast while open, moves to half-open after cooldown, closes on trial successes,
-reopens on a trial failure, limits trial calls, and prunes the window.
+fast while open, moves to half-open after cooldown, closes on a probe success,
+reopens on a probe failure, admits only the sampled fraction as probes, and
+prunes the window.
 
 ```bash
 python -m pytest tests/ -q

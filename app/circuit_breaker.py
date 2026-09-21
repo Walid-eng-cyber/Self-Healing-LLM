@@ -27,6 +27,7 @@ The clock is injectable so the whole state machine can be tested without sleeps.
 from __future__ import annotations
 
 import math
+import random
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -57,9 +58,10 @@ class CircuitBreaker:
         error_rate_threshold: float = 0.5,
         p95_budget_ms: float = 2000.0,
         open_cooldown_seconds: float = 15.0,
-        half_open_max_calls: int = 3,
-        half_open_successes_to_close: int = 2,
+        half_open_probe_ratio: float = 0.1,
+        half_open_successes_to_close: int = 1,
         clock: Callable[[], float] = time.monotonic,
+        rand: Callable[[], float] = random.random,
     ) -> None:
         self.name = name
         self.window_seconds = window_seconds
@@ -67,14 +69,15 @@ class CircuitBreaker:
         self.error_rate_threshold = error_rate_threshold
         self.p95_budget_ms = p95_budget_ms
         self.open_cooldown_seconds = open_cooldown_seconds
-        self.half_open_max_calls = half_open_max_calls
+        # Fraction of traffic sent to a recovering provider as probes (0..1).
+        self.half_open_probe_ratio = half_open_probe_ratio
         self.half_open_successes_to_close = half_open_successes_to_close
         self._clock = clock
+        self._rand = rand
 
         self.state = CircuitState.CLOSED
         self._outcomes: deque[_Outcome] = deque()
         self._opened_at = 0.0
-        self._half_open_calls = 0
         self._half_open_successes = 0
         self.last_trip_reason: str | None = None
 
@@ -112,10 +115,9 @@ class CircuitBreaker:
                 return False
 
         if self.state == CircuitState.HALF_OPEN:
-            if self._half_open_calls >= self.half_open_max_calls:
-                return False
-            self._half_open_calls += 1
-            return True
+            # Probe: send only a small fraction of traffic to the recovering
+            # provider; route the rest away (fail fast to other providers).
+            return self._rand() < self.half_open_probe_ratio
 
         return True  # CLOSED
 
@@ -129,11 +131,14 @@ class CircuitBreaker:
 
         if self.state == CircuitState.HALF_OPEN:
             if ok:
+                # A probe succeeded -> the provider looks recovered. Close once
+                # enough probes have passed (default: a single success closes).
                 self._half_open_successes += 1
                 if self._half_open_successes >= self.half_open_successes_to_close:
                     self._to_closed()
             else:
-                self._to_open(now, reason="half_open trial failed")
+                # A probe failed -> reopen immediately, restart the cooldown.
+                self._to_open(now, reason="half_open probe failed")
             return
 
         if self.state == CircuitState.CLOSED:
@@ -162,19 +167,16 @@ class CircuitBreaker:
     def _to_open(self, now: float, reason: str) -> None:
         self.state = CircuitState.OPEN
         self._opened_at = now
-        self._half_open_calls = 0
         self._half_open_successes = 0
         self.last_trip_reason = reason
 
     def _to_half_open(self) -> None:
         self.state = CircuitState.HALF_OPEN
-        self._half_open_calls = 0
         self._half_open_successes = 0
 
     def _to_closed(self) -> None:
         self.state = CircuitState.CLOSED
         self._outcomes.clear()  # fresh start after recovery
-        self._half_open_calls = 0
         self._half_open_successes = 0
 
     # -- observability ------------------------------------------------------

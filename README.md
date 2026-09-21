@@ -28,6 +28,10 @@ dashboard.
   explained from the ground up, in plain language. Start here to understand it.
 - [docs/circuit-breaker.md](docs/circuit-breaker.md) — the terse reference for
   the same: states, trip conditions, configuration, and how to verify it.
+- [docs/request-classes.md](docs/request-classes.md) — per-request-class
+  failover: why a classification call and a generation call reroute differently.
+- [docs/half-open-probes.md](docs/half-open-probes.md) — how a recovering
+  provider is probed with a small % of traffic and healed automatically.
 
 ## Run it
 
