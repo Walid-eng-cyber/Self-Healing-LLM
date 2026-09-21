@@ -1,314 +1,348 @@
-# Phase 2 — The Circuit Breaker, Explained
+# Phase 2 — Self-Healing Resilience
 
-**Goal of this phase:**
+Phase 1 routed every model call through one gateway. Phase 2 makes that gateway
+**resilient**: it detects failing providers, routes around them automatically,
+brings them back on their own once they recover, and shaves the slow tail off
+latency-sensitive traffic — all without a human touching anything.
 
-> Implement a circuit breaker per provider with closed, open, and half-open
-> states. Trip on error rate above threshold within the window, or p95 latency
-> above budget.
+This single document covers the whole of Phase 2. It is written to be understood
+top to bottom.
 
-This document explains what that means, why it matters, and exactly how the code
-does it — in plain language. Read it top to bottom and you will understand the
-whole thing.
+**What Phase 2 delivers:**
 
-Code: [`app/circuit_breaker.py`](../app/circuit_breaker.py) ·
-Tests: [`tests/test_circuit_breaker.py`](../tests/test_circuit_breaker.py)
+1. **A circuit breaker per provider** — detects a bad provider (by error rate or
+   p95 latency) and stops sending it traffic.
+2. **Half-open probes** — automatically tests a recovering provider with a small
+   trickle of traffic and heals it when it's back.
+3. **Per-request-class failover** — different kinds of request fail over
+   differently, each following its own provider preference list.
+4. **Hedged requests** — for latency-sensitive classes, race a second provider
+   after N ms and take the faster answer (with a documented cost trade-off).
 
----
-
-## 1. What problem does this solve?
-
-In Phase 1 the gateway learned to **fail over**: if a provider errors on a
-request, try the next one. That helps, but it has two weaknesses:
-
-1. **It only reacts to the request in front of it.** Every single request still
-   gets sent to the broken provider first, waits for it to fail, and only *then*
-   moves on. If the provider is down, you pay that "wait then fail" cost on
-   *every* call.
-2. **It has no memory.** It cannot notice "this provider has failed 8 of the
-   last 10 times — stop sending it traffic for a while."
-
-A **circuit breaker** fixes both. It watches how a provider is behaving over
-time, and when the provider is clearly unhealthy it **stops sending it traffic
-entirely** for a cooldown period — so requests skip it *instantly* instead of
-waiting to fail. Then it carefully checks whether the provider has recovered
-before trusting it again.
-
-### The real-world metaphor
-
-It is named after the electrical circuit breaker in your house. When something
-goes wrong (a short circuit), the breaker **trips** and cuts the power, instead
-of letting the wire overheat and start a fire. Once the problem is fixed, you
-**reset** it. Same idea here: when a provider misbehaves, we "cut the power" to
-it for a while.
+Contents:
+1. [The big picture](#1-the-big-picture)
+2. [The circuit breaker](#2-the-circuit-breaker-per-provider)
+3. [Half-open probes](#3-half-open-probes-automatic-recovery)
+4. [Request classes & per-class failover](#4-request-classes--per-class-failover)
+5. [Hedged requests & the cost trade-off](#5-hedged-requests--the-cost-trade-off)
+6. [How a request flows end to end](#6-how-a-request-flows-end-to-end)
+7. [Configuration reference](#7-configuration-reference)
+8. [Testing & verification](#8-testing--verification)
+9. [Summary](#9-summary)
 
 ---
 
-## 2. The three states
-
-The breaker for each provider is always in one of three states:
+## 1. The big picture
 
 ```
-  CLOSED ──(too many errors  OR  too slow)──► OPEN
-    ▲                                           │
-    │                                  (wait out the cooldown)
-    │                                           ▼
-    └────(a probe succeeds)──────────── HALF_OPEN
+ client ─► metadata gate ─► ROUTER ─► provider pool (each with a circuit breaker) ─► cost record ─► response
+                             │
+                             ├─ picks the provider list for the request's CLASS
+                             ├─ skips any provider whose BREAKER is open (failover)
+                             └─ for latency-sensitive classes, HEDGES a slow primary
+```
+
+Everything in Phase 2 lives in the **router** and the **circuit breaker** that
+guards each provider. The API surface from Phase 1 is unchanged — clients still
+send an OpenAI-shaped request and get an OpenAI-shaped response.
+
+Files:
+
+| File | Phase 2 role |
+|------|--------------|
+| `app/circuit_breaker.py` | The breaker state machine (trip, probe, recover) |
+| `app/providers.py` | `RouterProvider`: per-class failover + hedging; each `LiteLLMProvider` owns a breaker |
+| `app/config.py` | Breaker thresholds, request-class preference lists, hedge settings |
+| `app/accounting.py` | Usage records incl. request class, hedge flag, and cost |
+
+---
+
+## 2. The circuit breaker (per provider)
+
+A circuit breaker stops the gateway from repeatedly calling a provider that has
+gone bad. Each provider has its **own** breaker, so one vendor's outage is
+quarantined and never drags down the healthy ones.
+
+It is named after the electrical breaker in your house: when something goes
+wrong, it **trips** and cuts the power instead of letting the wire overheat.
+
+### The three states
+
+```
+  CLOSED ──(error rate > threshold  OR  p95 latency > budget)──► OPEN
+    ▲                                                             │
+    │                                                   (cooldown elapses)
+    │                                                             ▼
+    └────(a probe succeeds)──────────── HALF_OPEN ◄──── (send a small % as probes)
                                             │
-                                    (a probe fails)
+                                     (a probe fails)
                                             ▼
                                           OPEN
 ```
 
-- **CLOSED** = healthy / normal.
-  Requests flow through. The breaker quietly records the result of each one
-  (did it succeed? how long did it take?).
+| State | Meaning | What a request does |
+|-------|---------|---------------------|
+| **CLOSED** | Healthy/normal. Outcomes recorded in a sliding window. | Allowed through; result recorded. |
+| **OPEN** | Tripped. Provider considered down. | Skipped instantly ("fail fast") → router fails over. |
+| **HALF_OPEN** | Testing recovery after the cooldown. | A small % of traffic allowed as probes; the rest skip. |
 
-- **OPEN** = tripped / "do not use".
-  The provider is considered broken. Requests **skip it immediately** (this is
-  called *failing fast*) so the router moves straight to the next provider. The
-  breaker stays open for a cooldown period.
+> "Closed = working, open = broken" is counter-intuitive but standard, from
+> electrical circuits: a *closed* circuit lets current flow; an *open* one stops
+> it.
 
-- **HALF_OPEN** = testing the waters.
-  After the cooldown, the breaker cautiously lets a *few* requests through as a
-  test. If they succeed, the provider is back — close the breaker. If one fails,
-  it is still broken — open again.
+### When it trips (CLOSED → OPEN)
 
-> **Why the names?** "Closed" and "open" come from electrical circuits: a
-> *closed* circuit lets current flow (requests pass); an *open* circuit is
-> broken (requests stop). "Half-open" is the in-between trial state. It is
-> counter-intuitive at first — closed = working, open = broken — but it is the
-> standard terminology.
+While CLOSED, the breaker keeps every recent outcome (success/failure and
+latency) in a **sliding window** (default: last 30s). After each call — once it
+has at least `min_requests` samples (default 5) — it trips if **either**:
 
----
+1. **Error rate** over the window exceeds `error_rate_threshold` (default 50%), or
+2. **p95 latency** over the window exceeds `p95_budget_ms` (default 2000ms).
 
-## 3. When does it trip? (CLOSED → OPEN)
+The p95 rule matters: a provider can return 200s but be so slow it's effectively
+broken. p95 ("95% of requests were at least this fast") catches a real slowdown
+without overreacting to one slow request. The **minimum-samples** rule prevents a
+single early failure ("1 of 1 = 100%!") from tripping on noise.
 
-While the breaker is CLOSED, it keeps a list of recent outcomes in a **sliding
-window** — by default, everything from the last 30 seconds. Older results fall
-out of the window and stop counting.
-
-After each call, it asks: *"based on this window, is the provider unhealthy?"*
-It trips to OPEN if **either** of these is true:
-
-### Trip condition 1 — error rate too high
-
-> "Trip on error rate above threshold within the window."
-
-It counts how many calls in the window failed. If the failure rate is above the
-threshold (default **50%**), it trips.
-
-Example: in the last 30 seconds there were 10 calls and 6 failed → 60% error
-rate → above 50% → **trip.**
-
-### Trip condition 2 — too slow (p95 latency)
-
-> "or p95 latency above budget."
-
-Even if calls *succeed*, a provider that takes forever is effectively broken. So
-the breaker also watches latency — specifically the **p95 latency**.
-
-**What is p95?** If you line up the last N response times from fastest to
-slowest, the p95 is the value 95% of the way up. In plain terms: "95% of requests
-were at least this fast; only the slowest 5% were worse." It is a good health
-signal because it ignores one-off blips (a single slow request won't trip it) but
-catches a genuine slowdown (most requests getting slow).
-
-If the p95 latency in the window is above the budget (default **2000ms**), it
-trips.
-
-### The safety rule: minimum samples
-
-The breaker will **not** trip until it has seen at least `min_requests` calls
-(default **5**) in the window. Without this, a single failure ("1 out of 1 =
-100% error rate!") would trip the breaker instantly. Requiring a handful of
-samples first means it reacts to a *pattern*, not to noise.
-
-When it trips, it remembers **why** (e.g. `"error_rate 60% > 50%"`) — visible in
-`/health` as `last_trip_reason`.
+The reason it tripped is stored (`last_trip_reason`) and shown in `/health`.
 
 ---
 
-## 4. How does it recover? (OPEN → HALF_OPEN → CLOSED)
+## 3. Half-open probes (automatic recovery)
 
-Tripping is easy; the clever part is deciding when the provider is trustworthy
-again. The breaker does this gradually, so it never dumps full traffic onto a
-provider that is still shaky.
+Tripping is easy; the self-healing part is deciding when a provider is
+trustworthy again — safely, automatically.
 
-1. **OPEN — fail fast.**
-   For `open_cooldown_seconds` (default **15s**) after tripping, every request
-   skips this provider instantly. No calls are sent; the router uses other
-   providers.
+When the cooldown passes, the breaker moves to **HALF_OPEN** and sends only a
+**small percentage** of traffic to the recovering provider as **probes**
+(`half_open_probe_ratio`, default 10%); the other ~90% still fail fast to other
+providers. Trickling a little traffic — rather than flipping the provider fully
+back on — protects a shaky provider from being flooded the instant it returns.
 
-2. **HALF_OPEN — a careful test with probes.**
-   Once the cooldown passes, the breaker sends only a **small percentage** of
-   traffic back to the recovering provider as **probes**
-   (`half_open_probe_ratio`, default **10%**); the other ~90% still skip it and
-   go to other providers. Trickling a little traffic — rather than flipping the
-   provider fully back on — protects a fragile provider from being flooded the
-   instant it comes back.
-
-3. **Recover or relapse.**
-   - A probe **succeeds** → the provider looks healthy → **CLOSED** (default: a
-     single success is enough), and the window is wiped clean for a fresh start.
-   - A probe **fails** → straight back to **OPEN** immediately, and the cooldown
-     restarts. (A provider that is "sort of" back does not get to limp along.)
-
----
-
-## 5. How a request actually flows through it
-
-Every call to a provider goes through these four steps
-(`LiteLLMProvider.complete()` in [`app/providers.py`](../app/providers.py)):
+Each probe's result flips the breaker instantly:
 
 ```
-1. healthy flag?     A manual on/off switch for maintenance or demos.
-                     If off -> skip this provider.
-
-2. breaker.allow()?  Ask the breaker if a request may go through right now.
-                     - CLOSED    -> yes
-                     - OPEN      -> no (unless the cooldown just elapsed)
-                     - HALF_OPEN -> yes for a small % of traffic (probes)
-                     If "no" -> skip this provider (fail fast).
-
-3. call + time it    Send the request to the provider via LiteLLM, and measure
-                     how long it took.
-
-4. breaker.record()  Tell the breaker the outcome (success/failure + latency).
-                     This is what may trip the breaker, or heal it.
+   probe succeeds  ─────►  CLOSED   (recovered — use it fully again)
+   probe fails     ─────►  OPEN     (still broken — wait out another cooldown)
 ```
 
-When step 1 or 2 says "skip", the provider raises a `ProviderError`. The
-`RouterProvider` catches that and moves to the next provider in the pool. So an
-open circuit simply means **the router fails over instantly, without waiting.**
+- **Success → close** (default: a single success is enough), and the window is
+  wiped for a fresh start.
+- **Failure → reopen immediately**, and the cooldown restarts. A provider that is
+  only "sort of" back does not get to limp along.
 
-That is the whole payoff: a broken provider costs you nothing per request,
-because you stop knocking on its door until it is likely to answer.
+This automatic *trickle-and-decide* loop is what earns the gateway the name
+"self-healing": it brings a recovered provider back on its own, risking only a
+little traffic if it is still broken.
+
+Measured: over 1000 requests to a still-broken provider in half-open, ~10% were
+sent as probes and ~90% failed fast to a backup — matching the configured ratio.
 
 ---
 
-## 5b. Failover follows the request "class"
+## 4. Request classes & per-class failover
 
-When a breaker opens, which provider gets the traffic next? That depends on the
-**request class** — because not all requests should fail over the same way.
+Before this, the gateway had one provider order for everybody. But a cheap
+**classification** call ("spam: yes/no?") and an expensive **generation** call
+("write three paragraphs") have opposite priorities and should **not** fail over
+the same way.
 
-A cheap, high-volume **classification** call and an expensive **long-form
-generation** call have different priorities. So each class has its own ordered
-preference list of providers (`REQUEST_CLASSES` in
-[`app/config.py`](../app/config.py)):
+So every request can carry a **class**, and each class has its own ordered list
+of providers. The client sets the class with an optional header (keeping the
+gateway OpenAI-compatible):
+
+```
+X-Request-Class: classification
+```
+
+The lists live in `REQUEST_CLASSES` ([`app/config.py`](../app/config.py)):
 
 | Class | Preference order | Why |
 |-------|------------------|-----|
-| `classification` | ollama → gemini → openai | cheap and fast first; the expensive model is the last resort |
-| `generation` | openai → anthropic → ollama | quality first; the small local model only if the cloud is down |
-| `default` | the full pool in order | used when no class is given |
+| `classification` | ollama → gemini → openai | cheap/fast first; the big model is the last resort |
+| `generation` | openai → anthropic → ollama | quality first; the local model only if the cloud is down |
+| `default` | ollama → openai → anthropic → gemini | the full pool, for requests with no class |
 
-The client picks the class with an optional `X-Request-Class` header. The router
-then walks *that* list, skipping any provider whose breaker is open.
+The router walks *that class's* list — for both normal routing and failover —
+skipping any provider whose breaker is open. An unknown class falls back to
+`default`.
 
-Concretely: if `ollama`'s breaker trips **open** —
+### The payoff: same outage, different reroute
 
-- a `classification` request reroutes to **gemini** (next in its list),
-- a `generation` request is unaffected — it started at `openai` anyway.
+If `ollama`'s breaker trips open:
 
-Same outage, two different reroutes. That is the whole point: failover order is a
-property of the request class, not one fixed order for everyone.
+- a **classification** request reroutes to `gemini` (next in its list),
+- a **generation** request is unaffected — it started at `openai` anyway.
 
-## 6. Per-provider — and why that matters
-
-Each provider gets its **own** breaker. OpenAI's breaker knows nothing about
-Anthropic's. So if OpenAI has an outage:
-
-- OpenAI's breaker trips → OpenAI is skipped.
-- Anthropic, Gemini, and the local model keep serving normally.
-
-One bad provider is **quarantined**; it cannot drag down the healthy ones. That
-isolation is exactly why the breaker is per-provider and not one global switch.
+One outage, two different reroutes, each matching the class's priorities. That is
+impossible with a single global order.
 
 ---
 
-## 7. The settings you can tune
+## 5. Hedged requests & the cost trade-off
 
-All configurable via environment variables (defaults in
-[`app/config.py`](../app/config.py)):
+Some classes care about **tail latency** — the occasional slow request that makes
+a product feel laggy. Failover doesn't help (the provider hasn't *failed*, it's
+just *slow*). **Hedging** does.
 
-| Variable | Default | Plain meaning |
-|----------|---------|---------------|
-| `CB_WINDOW_SECONDS` | 30 | How far back "recent" goes |
-| `CB_MIN_REQUESTS` | 5 | Need at least this many calls before judging |
-| `CB_ERROR_RATE_THRESHOLD` | 0.5 | Trip above this failure rate (0.5 = 50%) |
-| `CB_P95_LATENCY_BUDGET_MS` | 2000 | Trip if p95 latency exceeds this |
-| `CB_OPEN_COOLDOWN_SECONDS` | 15 | How long to stay tripped before testing |
-| `CB_HALF_OPEN_PROBE_RATIO` | 0.1 | Fraction of traffic sent as probes while testing |
-| `CB_HALF_OPEN_SUCCESSES_TO_CLOSE` | 1 | Probe wins needed to fully recover |
+### How one hedged request works
 
-> **A real tuning gotcha.** The 2000ms latency budget suits fast cloud APIs. The
-> local Ollama model on this machine measured ~3.6s for one call — legitimately
-> slower. With a local provider you would raise `CB_P95_LATENCY_BUDGET_MS`, or
-> give slow-but-fine providers their own budget, so the breaker does not trip a
-> provider that is simply doing heavier work locally.
+```
+t = 0 ms   Send to the primary provider.
+           Answered before the timer? -> use it. Done. (No hedge.)
 
----
+t = N ms   Primary still working -> ALSO send to the second provider.
+           Race them: take whichever returns first, cancel the loser.
+           Both fail -> fall back to the rest of the class's list.
+```
 
-## 8. Seeing it in action
+`N` is the hedge delay. A smaller `N` hedges more requests (lower latency, more
+spend); a larger `N` hedges fewer. The response carries a `hedged` flag.
 
-### In `/health`
+### Opt-in per class
 
-Every provider reports its circuit live:
+Hedging is enabled per class in `CLASS_HEDGE_MS` ([`app/config.py`](../app/config.py)):
 
-```json
-{
-  "name": "ollama",
-  "mode": "live",
-  "circuit": {
-    "state": "closed",
-    "samples": 1,
-    "error_rate": 0.0,
-    "p95_latency_ms": 3594.1,
-    "last_trip_reason": null
-  }
+```python
+CLASS_HEDGE_MS = {
+    "classification": 200,   # hedge after 200ms
+    # "generation" is deliberately omitted -> never hedges
 }
 ```
 
-### The tests (every transition, no waiting)
+### ⚠️ The cost trade-off
 
-The breaker takes its clock as an input, so the tests can *fast-forward time*
-instead of sleeping. That lets them prove the full lifecycle in milliseconds:
+**Hedging roughly doubles spend on the calls that actually hedge.** When the
+timer fires, the request runs on **two providers at once**. You keep one answer,
+but **both may bill** you — the loser is cancelled, but often only after it has
+already generated (billable) tokens.
 
-```bash
-python -m pytest tests/test_circuit_breaker.py -v
+| Situation | Cost |
+|-----------|------|
+| Primary answers before the timer (no hedge) | same as before |
+| Primary is slow, hedge fires | **~2×** |
+
+That is why it is enabled **per class**:
+
+| Class | Hedged? | Reasoning |
+|-------|---------|-----------|
+| `classification` | yes (200ms) | short, cheap calls where a slow tail hurts UX; 2× of cheap is still cheap |
+| `generation` | no | long, expensive calls; paying twice is rarely worth it |
+
+**Rule of thumb:** hedge cheap, fast, latency-sensitive classes; do not hedge
+expensive, long-running ones. Each usage record includes `hedged` and
+`estimated_cost_with_hedge_usd` (~2×) so the real bill stays visible.
+
+---
+
+## 6. How a request flows end to end
+
 ```
+1. Metadata gate   Require X-Tenant-Id + X-Feature (400 if missing). Read the
+                   optional X-Request-Class (default: "default"). Mint a
+                   request id if absent.
 
-11 tests, one per behavior: starts closed, does not trip below the minimum
-sample count, trips on error rate, does not trip at/under the threshold, trips on
-p95 latency, fails fast while open, moves to half-open after the cooldown, closes
-on a probe success, reopens on a probe failure, admits only the sampled
-fraction of traffic as probes, and prunes old results out of the window.
+2. Pick the list   The router resolves the request's class to its ordered
+                   provider preference list.
 
-### End-to-end through the router
+3. Route           - Hedged class? Start the primary; if it is slow past N ms,
+                     fire the second provider and race, cancelling the loser.
+                   - Otherwise, try providers in order.
+                   Either way, a provider whose circuit breaker is OPEN is
+                   skipped instantly (fail fast) and the next one is tried.
 
-A broken provider trips and traffic fails over; once repaired, it recovers
-through half-open:
+4. Record          Each provider call feeds its breaker (success/failure +
+                   latency), which may trip or heal it. The winning provider's
+                   usage is logged with tenant, feature, class, hedge flag, and
+                   estimated cost.
 
-```
-req 1: served_by=backup   primary.circuit=closed
-req 2: served_by=backup   primary.circuit=closed
-req 3: served_by=backup   primary.circuit=open       <- tripped (error rate)
-req 4: served_by=backup   primary.circuit=open       <- failing fast
-...  (primary repaired, cooldown elapses)
-req 1: served_by=primary  primary.circuit=half_open  <- trial request
-req 2: served_by=primary  primary.circuit=closed     <- recovered
+5. Respond         Return the OpenAI-shaped reply, with X-Request-Id echoed and
+                   a non-standard served_by / hedged for observability.
 ```
 
 ---
 
-## 9. One-paragraph summary
+## 7. Configuration reference
 
-Each provider has a circuit breaker that watches its recent calls in a sliding
-window. If too many fail (error rate over threshold) or they get too slow (p95
-latency over budget), the breaker **trips open** and the router skips that
-provider instantly instead of waiting for it to fail. After a cooldown the
-breaker lets a few **trial** requests through; if they succeed it **closes** and
-the provider is trusted again, and if they fail it stays open. Because each
-provider has its own breaker, one provider's outage never affects the others.
-That automatic trip-and-heal, per provider, is what makes the gateway
-self-healing.
+### Circuit breaker (per provider) — environment variables
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CB_WINDOW_SECONDS` | 30 | Sliding window for error rate + latency |
+| `CB_MIN_REQUESTS` | 5 | Minimum samples before the breaker may trip |
+| `CB_ERROR_RATE_THRESHOLD` | 0.5 | Trip if error rate exceeds this (0–1) |
+| `CB_P95_LATENCY_BUDGET_MS` | 2000 | Trip if p95 latency exceeds this |
+| `CB_OPEN_COOLDOWN_SECONDS` | 15 | How long OPEN lasts before probing |
+| `CB_HALF_OPEN_PROBE_RATIO` | 0.1 | Fraction of traffic sent as probes while HALF_OPEN |
+| `CB_HALF_OPEN_SUCCESSES_TO_CLOSE` | 1 | Probe successes needed to close |
+
+> **Tuning note.** The 2000ms p95 budget suits cloud APIs. A local model (Ollama)
+> can legitimately be slower (~3.6s here). Raise `CB_P95_LATENCY_BUDGET_MS` if you
+> keep a local provider, or it will trip on honest local latency.
+
+### Request classes & hedging — `app/config.py`
+
+- `REQUEST_CLASSES` — `{class: [provider names in preference order]}`.
+- `CLASS_HEDGE_MS` — `{class: hedge delay ms}`; classes absent here never hedge.
+
+Both are visible at runtime: `GET /` returns `request_classes` and
+`hedged_classes_ms`; `GET /health` returns each provider's circuit state.
+
+---
+
+## 8. Testing & verification
+
+All state machines take an injectable clock (and the breaker an injectable random
+source), so tests drive every transition deterministically — no sleeps.
+
+```bash
+python -m pytest tests/ -q      # 26 passed
+```
+
+- **`tests/test_circuit_breaker.py`** — trips on error rate; trips on p95 latency;
+  does not trip below min samples or at/under threshold; fails fast while open;
+  moves to half-open after cooldown; probe admitted when sampled / skipped when
+  not; closes on a probe success; reopens on a probe failure; prunes the window.
+- **`tests/test_class_routing.py`** — per-class preference order; failover follows
+  the class list when a breaker is open; same outage reroutes differently by
+  class; unknown class falls back; all-open-in-class errors.
+- **`tests/test_hedging.py`** — fast primary (no hedge); hedge fires and the
+  second wins (primary cancelled); hedge fires but the primary still wins (second
+  cancelled); non-hedged class stays sequential; both raced fail → fallback;
+  primary fails fast → failover without hedging.
+
+Live snapshots:
+
+```
+# circuit breaker: trip then recover through half-open
+req 3: served_by=backup   primary.circuit=open       (tripped on error rate)
+...  (repaired, cooldown elapses)
+req 1: served_by=primary  primary.circuit=half_open  (probe)
+req 2: served_by=primary  primary.circuit=closed     (recovered)
+
+# per-class routing (all healthy)
+classification -> ollama    generation -> openai
+
+# hedging (local primary too slow -> hedge wins)
+classification -> served_by=gemini  hedged=True   242ms
+generation     -> served_by=openai  hedged=False    5ms
+```
+
+---
+
+## 9. Summary
+
+Phase 2 turns the single-door gateway into a self-healing one:
+
+- Each provider has a **circuit breaker** that trips on error rate or p95 latency
+  and quarantines a bad provider.
+- **Half-open probes** send a small % of traffic to a recovering provider and
+  heal it automatically — close on a probe success, reopen on a failure.
+- **Per-class failover** means a classification call and a generation call reroute
+  differently, each down its own preference list.
+- **Hedging** trims tail latency for latency-sensitive classes by racing a second
+  provider, at a documented ~2× cost on the calls that hedge.
+
+Together these make the gateway keep serving through provider outages and
+slowdowns, recover on its own, and let you trade money for latency deliberately,
+per class.

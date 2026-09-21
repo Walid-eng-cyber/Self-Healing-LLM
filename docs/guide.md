@@ -221,7 +221,7 @@ all down           -> error (expected)
 The `healthy` flag is still there as a manual kill-switch, but failover no
 longer depends on flipping it by hand. Each provider now has a **circuit
 breaker** that detects trouble and reroutes on its own — see
-[circuit-breaker.md](circuit-breaker.md). In short: if a provider's error rate or
+[phase-2.md](phase-2.md). In short: if a provider's error rate or
 p95 latency crosses a threshold, its breaker trips **open** and the router skips
 it instantly; after a cooldown the breaker tests it with a few trial requests and
 **closes** again once it recovers. That automatic trip-and-heal is what makes the
@@ -370,9 +370,9 @@ Then:
   attribution.
 
 **Also built (Phase 2):**
-- **Per-provider circuit breaker** (closed / open / half-open) that trips on
-  error rate or p95 latency and recovers on its own — automatic, no manual flag.
-  See [circuit-breaker.md](circuit-breaker.md).
+- **Per-provider circuit breaker** (closed / open / half-open) with half-open
+  probes, per-request-class failover, and hedged requests for latency-sensitive
+  classes. Full write-up in [phase-2.md](phase-2.md).
 
 **Next steps (not built yet):**
 - **Redis** — cache identical answers (save money) and enforce rate limits.
