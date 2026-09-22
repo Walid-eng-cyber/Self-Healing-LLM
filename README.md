@@ -1,8 +1,18 @@
 # Self-Healing LLM Gateway
 
-An OpenAI-compatible gateway that routes every model call through one service.
-When a provider fails, it reroutes traffic automatically and shows it on a live
-dashboard.
+**An OpenAI-compatible gateway that spreads your LLM calls across multiple providers and automatically reroutes around any that fail or slow down — so your app keeps working when a provider doesn't.**
+
+![Architecture: client → gateway → provider pool with circuit breakers → response](docs/architecture.svg)
+
+## What it does
+
+- **Drop-in OpenAI-compatible** — point your OpenAI client's `base_url` at it; no other code changes.
+- **Automatic failover** across OpenAI, Anthropic, Gemini, and a local Ollama model, normalized with LiteLLM.
+- **Self-healing** — a per-provider circuit breaker detects failures or slowness and brings a provider back on its own once it recovers.
+- **Cost attribution** — every call is tagged to a tenant / feature with an estimated cost.
+- **Survives outages** — non-urgent ("deferrable") requests are queued and retried in the background instead of failing.
+
+Runs fully locally with **no API keys** (uses a local Ollama model if available, mock responses otherwise).
 
 ## Roadmap
 
@@ -16,7 +26,10 @@ dashboard.
   recovers on its own via half-open probes; failover follows per-request-class
   preference lists; and latency-sensitive classes can hedge. Full write-up in
   [docs/phase-2.md](docs/phase-2.md).
-- Phase 3: Redis caching + rate limiting.
+- **Phase 3 (in progress): Queue & retry deferrable work.** Requests are
+  classified at the API boundary as interactive (fail fast) or deferrable
+  (queued and retried in the background so they survive an outage). See
+  [docs/phase-3.md](docs/phase-3.md).
 - Phase 4: Prometheus metrics + Grafana dashboard.
 
 ## Documentation
@@ -29,6 +42,9 @@ dashboard.
 - **[docs/phase-2.md](docs/phase-2.md)** — the complete Phase 2 write-up in one
   place: the circuit breaker, half-open probes, per-request-class failover, and
   hedged requests (with the cost trade-off), plus config and tests.
+- **[docs/phase-3.md](docs/phase-3.md)** — Phase 3 (in progress): interactive vs
+  deferrable requests, and how deferrable work is queued and retried to survive
+  an outage.
 
 ## Run it
 
@@ -39,7 +55,8 @@ python -m uvicorn app.main:app --port 8000 --reload
 
 Then open http://localhost:8000/docs
 
-By default it uses the built-in **mock** provider, so it runs with no API key.
+It runs with **no API keys**: it uses a local Ollama model if one is running,
+and falls back to mock responses otherwise — so failover works out of the box.
 
 ## Use it from an existing OpenAI client
 
@@ -69,18 +86,20 @@ rejected with 400). `X-Request-Id` is optional — it's generated if absent and
 always returned in the response's `X-Request-Id` header. Each call emits a
 usage record tying tenant + feature to tokens and estimated cost.
 
-## Use a real upstream
+## Use real providers
 
-Copy `.env.example` to `.env`, set `GATEWAY_DEFAULT_PROVIDER=openai` and your
-`OPENAI_API_KEY`, then restart. Any OpenAI-compatible base URL works
-(OpenAI, Groq, Together, a local vLLM server, ...).
+Copy `.env.example` to `.env` and add a key for any provider you want to run live
+(`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`). Providers without a key
+run in mock mode, so the gateway always starts and failover always has somewhere
+to go. A local Ollama model needs no key — just a running Ollama server.
 
 ## Endpoints
 
-| Method | Path                    | Purpose                          |
-|--------|-------------------------|----------------------------------|
-| POST   | `/v1/chat/completions`  | OpenAI-compatible chat endpoint  |
-| GET    | `/v1/models`            | Minimal model list               |
-| GET    | `/health`               | Liveness check                   |
-| GET    | `/`                     | Service info                     |
-| GET    | `/docs`                 | Interactive API docs             |
+| Method | Path                    | Purpose                              |
+|--------|-------------------------|--------------------------------------|
+| POST   | `/v1/chat/completions`  | OpenAI-compatible chat endpoint      |
+| GET    | `/v1/jobs/{job_id}`     | Status of a queued deferrable request|
+| GET    | `/v1/models`            | Minimal model list                   |
+| GET    | `/health`               | Provider pool + circuit state        |
+| GET    | `/`                     | Service info                         |
+| GET    | `/docs`                 | Interactive API docs                 |

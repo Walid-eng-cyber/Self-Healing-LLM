@@ -30,6 +30,8 @@ class RequestMetadata:
     feature: str
     request_id: str
     request_class: str = DEFAULT_REQUEST_CLASS
+    # "interactive" (caller waiting, fail fast) or "deferrable" (queue + retry).
+    mode: str = "interactive"
 
 
 class MissingMetadata(Exception):
@@ -49,6 +51,7 @@ async def get_metadata(
     x_feature: str | None = Header(default=None, alias="X-Feature"),
     x_request_id: str | None = Header(default=None, alias="X-Request-Id"),
     x_request_class: str | None = Header(default=None, alias="X-Request-Class"),
+    x_request_mode: str | None = Header(default=None, alias="X-Request-Mode"),
 ) -> RequestMetadata:
     """FastAPI dependency: extract and validate request metadata."""
     tenant = _clean(x_tenant_id)
@@ -69,9 +72,16 @@ async def get_metadata(
     # An unknown class is tolerated here and falls back in the router.
     request_class = _clean(x_request_class) or DEFAULT_REQUEST_CLASS
 
+    # Interactive (default) fails fast; deferrable is queued and retried. An
+    # unrecognized mode falls back to the safe default (interactive).
+    mode = _clean(x_request_mode).lower()
+    if mode not in ("interactive", "deferrable"):
+        mode = "interactive"
+
     return RequestMetadata(
         tenant=tenant,
         feature=feature,
         request_id=request_id,
         request_class=request_class,
+        mode=mode,
     )

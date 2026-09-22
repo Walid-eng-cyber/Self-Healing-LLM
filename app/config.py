@@ -114,6 +114,13 @@ class Settings:
     CB_HALF_OPEN_PROBE_RATIO: float = float(os.getenv("CB_HALF_OPEN_PROBE_RATIO", "0.1"))
     CB_HALF_OPEN_SUCCESSES_TO_CLOSE: int = int(os.getenv("CB_HALF_OPEN_SUCCESSES_TO_CLOSE", "1"))
 
+    # --- Deferrable job queue (Phase 3) ---
+    # Deferrable requests that can't be served now are queued and retried with
+    # exponential backoff, so they survive a provider outage.
+    JOB_MAX_ATTEMPTS: int = int(os.getenv("JOB_MAX_ATTEMPTS", "10"))
+    JOB_BACKOFF_BASE_S: float = float(os.getenv("JOB_BACKOFF_BASE_S", "1.0"))
+    JOB_BACKOFF_CAP_S: float = float(os.getenv("JOB_BACKOFF_CAP_S", "30"))
+
     def breaker_kwargs(self) -> dict:
         return {
             "window_seconds": self.CB_WINDOW_SECONDS,
